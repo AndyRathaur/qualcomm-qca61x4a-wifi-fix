@@ -1,0 +1,3 @@
+# Runtime recovery logs and throttle state
+*.log
+.wifi_recovery_throttle
