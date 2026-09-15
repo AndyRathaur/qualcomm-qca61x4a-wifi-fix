@@ -91,13 +91,18 @@ $isConfirmedCrash = ($Trigger -eq "8002" -or $Trigger -eq "8003")
 if (-not $Force -and -not $isConfirmedCrash) {
     $adapter = Get-NetAdapter -Name $InterfaceName -ErrorAction SilentlyContinue
     if ($adapter -and $adapter.Status -eq "Up") {
-        # Quick .NET ping to verify if internet is already reachable
+        # Two-strike .NET ping check to verify if internet is already reachable (eliminates false positives)
         $pingOk = $false
         try {
             $p = New-Object System.Net.NetworkInformation.Ping
-            $reply = $p.Send("8.8.8.8", 800)
-            if ($reply -and $reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
-                $pingOk = $true
+            foreach ($target in @("8.8.8.8", "1.1.1.1")) {
+                try {
+                    $reply = $p.Send($target, 1000)
+                    if ($reply -and $reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                        $pingOk = $true
+                        break
+                    }
+                } catch {}
             }
         } catch {}
 
