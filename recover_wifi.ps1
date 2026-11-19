@@ -4,9 +4,9 @@
 
 .DESCRIPTION
     Safely resets the Wi-Fi adapter when triggered by an Event 8002/8003 watchdog or periodic Heartbeat.
-    Includes rate-limiting (throttling to max 1 reset per 60s), pre-flight ping checks (for heartbeat),
-    fast native Win32/netsh adapter cycling (500ms settle), reactive radio readiness polling, dynamic
-    profile auto-detection, and reactive reconnection.
+    Includes rate-limiting (throttling to max 1 reset per 60s), two-strike pre-flight ping checks (for heartbeat),
+    fast native Win32/NDIS adapter cycling (250ms settle), in-memory Win32 Native Wifi API (wlanapi.dll)
+    state polling (<1ms latency), dynamic profile auto-detection preserving whitespace, and fast reconnection.
 
 .PARAMETER Trigger
     Identifies the trigger source (e.g. '8002', '8003', 'Heartbeat', 'Manual').
@@ -18,7 +18,7 @@
     Optional SSID/Profile name to connect to. If omitted, automatically detects the first saved profile.
 
 .PARAMETER InterfaceName
-    Optional network interface name. If omitted, automatically detects the wireless adapter or defaults to 'Wi-Fi'.
+    Optional network interface name. Defaults to 'Wi-Fi'.
 #>
 
 [CmdletBinding()]
@@ -26,7 +26,7 @@ param(
     [string]$Trigger = "Manual",
     [switch]$Force,
     [string]$ProfileName,
-    [string]$InterfaceName
+    [string]$InterfaceName = "Wi-Fi"
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -44,7 +44,7 @@ $logPath      = Join-Path $scriptDir "wifi_recovery.log"
 $throttleFile = Join-Path $scriptDir ".wifi_recovery_throttle"
 $throttleSecs = 60
 
-# Resolve interface name dynamically if not specified
+# Resolve interface name dynamically if not specified or empty
 if ([string]::IsNullOrWhiteSpace($InterfaceName)) {
     $wlanAdapter = Get-NetAdapter | Where-Object { 
         $_.InterfaceDescription -match "Qualcomm|QCA61x4A|168C|Wireless|Wi-Fi|802\.11" -or 
@@ -52,6 +52,196 @@ if ([string]::IsNullOrWhiteSpace($InterfaceName)) {
     } | Select-Object -First 1
 
     $InterfaceName = if ($wlanAdapter) { $wlanAdapter.Name } else { "Wi-Fi" }
+}
+
+# -------------------------------------------------------------------------
+# Define Native Win32 Wifi API (wlanapi.dll) Type for Sub-millisecond Polling
+# -------------------------------------------------------------------------
+if (-not ([System.Management.Automation.PSTypeName]'NativeWlan').Type) {
+    $nativeWlanSource = @'
+using System;
+using System.Runtime.InteropServices;
+
+public class NativeWlan {
+    [DllImport("wlanapi.dll", SetLastError = true)]
+    public static extern uint WlanOpenHandle(
+        uint dwClientVersion,
+        IntPtr pReserved,
+        out uint pdwNegotiatedVersion,
+        out IntPtr phClientHandle
+    );
+
+    [DllImport("wlanapi.dll", SetLastError = true)]
+    public static extern uint WlanCloseHandle(
+        IntPtr hClientHandle,
+        IntPtr pReserved
+    );
+
+    [DllImport("wlanapi.dll", SetLastError = true)]
+    public static extern uint WlanEnumInterfaces(
+        IntPtr hClientHandle,
+        IntPtr pReserved,
+        out IntPtr ppInterfaceList
+    );
+
+    [DllImport("wlanapi.dll", SetLastError = true)]
+    public static extern uint WlanQueryInterface(
+        IntPtr hClientHandle,
+        [In] ref Guid pInterfaceGuid,
+        int OpCode,
+        IntPtr pReserved,
+        out uint pdwDataSize,
+        out IntPtr ppData,
+        IntPtr pWlanOpcodeValueType
+    );
+
+    [DllImport("wlanapi.dll", SetLastError = true)]
+    public static extern void WlanFreeMemory(IntPtr pMemory);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct WLAN_CONNECTION_PARAMETERS {
+        public int wlanConnectionMode; // 0 = profile
+        [MarshalAs(UnmanagedType.LPWStr)]
+        public string strProfile;
+        public IntPtr pDot11Ssid;
+        public IntPtr pDesiredBssidList;
+        public int dot11BssType; // 1 = infrastructure
+        public uint dwFlags;
+    }
+
+    [DllImport("wlanapi.dll", SetLastError = true)]
+    public static extern uint WlanConnect(
+        IntPtr hClientHandle,
+        [In] ref Guid pInterfaceGuid,
+        [In] ref WLAN_CONNECTION_PARAMETERS pConnectionParameters,
+        IntPtr pReserved
+    );
+
+    public enum WLAN_INTERFACE_STATE {
+        not_ready = 0,
+        connected = 1,
+        ad_hoc_network_formed = 2,
+        disconnecting = 3,
+        disconnected = 4,
+        associating = 5,
+        discovering = 6,
+        authenticating = 7
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct WLAN_INTERFACE_INFO {
+        public Guid InterfaceGuid;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string strInterfaceDescription;
+        public WLAN_INTERFACE_STATE isState;
+    }
+
+    private static IntPtr _cachedHandle = IntPtr.Zero;
+    private static Guid _cachedGuid = Guid.Empty;
+    private static readonly object _lock = new object();
+
+    public static void Reset() {
+        lock (_lock) {
+            if (_cachedHandle != IntPtr.Zero) {
+                try { WlanCloseHandle(_cachedHandle, IntPtr.Zero); } catch {}
+                _cachedHandle = IntPtr.Zero;
+            }
+            _cachedGuid = Guid.Empty;
+        }
+    }
+
+    public static string GetInterfaceState(string descriptionFilter = null) {
+        lock (_lock) {
+            if (_cachedHandle == IntPtr.Zero) {
+                uint negVer;
+                if (WlanOpenHandle(2, IntPtr.Zero, out negVer, out _cachedHandle) != 0) {
+                    _cachedHandle = IntPtr.Zero;
+                    return "not_ready";
+                }
+            }
+
+            if (_cachedGuid != Guid.Empty && string.IsNullOrEmpty(descriptionFilter)) {
+                uint dataSize;
+                IntPtr pData;
+                uint res = WlanQueryInterface(_cachedHandle, ref _cachedGuid, 6, IntPtr.Zero, out dataSize, out pData, IntPtr.Zero);
+                if (res == 0 && pData != IntPtr.Zero) {
+                    try {
+                        int stateVal = Marshal.ReadInt32(pData);
+                        return ((WLAN_INTERFACE_STATE)stateVal).ToString();
+                    } finally {
+                        WlanFreeMemory(pData);
+                    }
+                }
+                _cachedGuid = Guid.Empty;
+            }
+
+            IntPtr pList = IntPtr.Zero;
+            try {
+                uint enumRes = WlanEnumInterfaces(_cachedHandle, IntPtr.Zero, out pList);
+                if (enumRes != 0 || pList == IntPtr.Zero) {
+                    try { WlanCloseHandle(_cachedHandle, IntPtr.Zero); } catch {}
+                    _cachedHandle = IntPtr.Zero;
+                    uint negVer;
+                    if (WlanOpenHandle(2, IntPtr.Zero, out negVer, out _cachedHandle) == 0) {
+                        enumRes = WlanEnumInterfaces(_cachedHandle, IntPtr.Zero, out pList);
+                    }
+                    if (enumRes != 0 || pList == IntPtr.Zero) return "not_ready";
+                }
+
+                int count = Marshal.ReadInt32(pList, 0);
+                if (count == 0) return "not_ready";
+
+                int itemSize = Marshal.SizeOf(typeof(WLAN_INTERFACE_INFO));
+                for (int i = 0; i < count; i++) {
+                    IntPtr pItem = new IntPtr(pList.ToInt64() + 8 + (i * itemSize));
+                    WLAN_INTERFACE_INFO info = (WLAN_INTERFACE_INFO)Marshal.PtrToStructure(pItem, typeof(WLAN_INTERFACE_INFO));
+                    if (string.IsNullOrEmpty(descriptionFilter) || 
+                        info.strInterfaceDescription.IndexOf(descriptionFilter, StringComparison.OrdinalIgnoreCase) >= 0) {
+                        _cachedGuid = info.InterfaceGuid;
+                        return info.isState.ToString();
+                    }
+                }
+
+                IntPtr pFirst = new IntPtr(pList.ToInt64() + 8);
+                WLAN_INTERFACE_INFO firstInfo = (WLAN_INTERFACE_INFO)Marshal.PtrToStructure(pFirst, typeof(WLAN_INTERFACE_INFO));
+                _cachedGuid = firstInfo.InterfaceGuid;
+                return firstInfo.isState.ToString();
+            } catch {
+                return "unknown";
+            } finally {
+                if (pList != IntPtr.Zero) WlanFreeMemory(pList);
+            }
+        }
+    }
+
+    public static uint Connect(string profileName) {
+        lock (_lock) {
+            if (_cachedHandle == IntPtr.Zero) {
+                uint negVer;
+                if (WlanOpenHandle(2, IntPtr.Zero, out negVer, out _cachedHandle) != 0) {
+                    _cachedHandle = IntPtr.Zero;
+                    return 999;
+                }
+            }
+
+            if (_cachedGuid == Guid.Empty) {
+                GetInterfaceState();
+            }
+
+            if (_cachedGuid == Guid.Empty) return 998;
+
+            WLAN_CONNECTION_PARAMETERS p = new WLAN_CONNECTION_PARAMETERS();
+            p.wlanConnectionMode = 0; // profile
+            p.strProfile = profileName;
+            p.dot11BssType = 1; // infrastructure
+            p.dwFlags = 0;
+
+            return WlanConnect(_cachedHandle, ref _cachedGuid, ref p, IntPtr.Zero);
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $nativeWlanSource -Language CSharp
 }
 
 function Write-RecoveryLog {
@@ -114,7 +304,7 @@ if (-not $Force -and -not $isConfirmedCrash) {
 }
 
 # -------------------------------------------------------------------------
-# Dynamic Wi-Fi Profile Detection (if not explicitly passed)
+# Dynamic Wi-Fi Profile Detection (preserving trailing whitespace)
 # -------------------------------------------------------------------------
 if ([string]::IsNullOrWhiteSpace($ProfileName)) {
     $profilesOut = & netsh wlan show profiles interface="$InterfaceName" 2>$null
@@ -122,7 +312,7 @@ if ([string]::IsNullOrWhiteSpace($ProfileName)) {
         $profilesOut = & netsh wlan show profiles 2>$null
     }
     foreach ($line in $profilesOut) {
-        if ($line -match 'All User Profile\s*:\s*(.+)$') {
+        if ($line -match '^\s*All User Profile\s*:\s*(.+)$') {
             $candidate = $matches[1]
             if ($candidate -and $candidate.Trim() -ne "<None>") {
                 $ProfileName = $candidate
@@ -144,80 +334,80 @@ Write-RecoveryLog "RECOVERING" "Initiating transceiver hardware reset cycle on '
 # -------------------------------------------------------------------------
 # 3. Fast Transceiver Hardware Cycle (Disable -> Settle -> Enable)
 # -------------------------------------------------------------------------
+[NativeWlan]::Reset()
 try {
-    # Fast native Win32/NDIS disable
+    # Fast NDIS disable with netsh fallback
+    Disable-NetAdapter -Name "$InterfaceName" -Confirm:$false -ErrorAction Stop
+} catch {
     & netsh interface set interface name="$InterfaceName" admin=DISABLED
-    if ($LASTEXITCODE -ne 0) {
-        Disable-NetAdapter -Name "$InterfaceName" -Confirm:$false -ErrorAction Stop
-    }
-} catch {
-    Write-RecoveryLog "WARNING" "Netsh disable failed, fell back to Disable-NetAdapter: $_"
 }
 
-# 500ms hardware settle time
-Start-Sleep -Milliseconds 500
+# 250ms hardware settle time (optimized from 500ms for faster recovery)
+Start-Sleep -Milliseconds 250
 
 try {
-    # Fast native Win32/NDIS enable
-    & netsh interface set interface name="$InterfaceName" admin=ENABLED
-    if ($LASTEXITCODE -ne 0) {
-        Enable-NetAdapter -Name "$InterfaceName" -Confirm:$false -ErrorAction Stop
-    }
+    # Fast NDIS enable with netsh fallback
+    Enable-NetAdapter -Name "$InterfaceName" -Confirm:$false -ErrorAction Stop
 } catch {
-    Write-RecoveryLog "WARNING" "Netsh enable failed, fell back to Enable-NetAdapter: $_"
+    & netsh interface set interface name="$InterfaceName" admin=ENABLED
 }
 
 # -------------------------------------------------------------------------
-# 4. Reactive Radio Readiness (100ms polling, max 1.5s)
+# 4. Reactive Radio Readiness Polling (50ms polling, max 2.0s via Native Wifi API)
 # -------------------------------------------------------------------------
-for ($i = 0; $i -lt 15; $i++) {
-    Start-Sleep -Milliseconds 100
-    $ifOut = & netsh wlan show interfaces
-    if ($ifOut -match "State\s*:\s*(disconnected|connected|associating)") {
+for ($i = 0; $i -lt 40; $i++) {
+    $state = [NativeWlan]::GetInterfaceState()
+    if ($state -ne "not_ready" -and $state -ne "unknown" -and $state -ne "none") {
         break
     }
+    Start-Sleep -Milliseconds 50
 }
 
 # -------------------------------------------------------------------------
-# 5. Fast Reconnection to Detected/Specified Profile
+# 5. Fast Reconnection to Target Profile (In-Memory Polling, No Bogus Fallback)
 # -------------------------------------------------------------------------
 $connected = $false
 
 if ($ProfileName) {
-    # Attempt connection to target profile
-    & netsh wlan connect name="$ProfileName" interface="$InterfaceName" 2>$null | Out-Null
+    # Issue fast asynchronous connection request via Win32 Native Wifi API
+    $connectRes = [NativeWlan]::Connect($ProfileName)
+    if ($connectRes -ne 0) {
+        & netsh wlan connect name="$ProfileName" interface="$InterfaceName" 2>$null | Out-Null
+    }
 
-    # Reactive polling loop (max 3.5s)
-    for ($i = 0; $i -lt 24; $i++) {
-        Start-Sleep -Milliseconds 150
-        $ifStatus = & netsh wlan show interfaces
-        if ($ifStatus -match "State\s*:\s*connected") {
+    # Reactive polling loop via in-memory Win32 Native Wifi API (every 50ms, max 4.0s)
+    for ($i = 0; $i -lt 80; $i++) {
+        $state = [NativeWlan]::GetInterfaceState()
+        if ($state -eq "connected") {
             $connected = $true
             break
         }
+        Start-Sleep -Milliseconds 50
     }
 
-    # Fallback attempt with trimmed profile name if string differed
-    if (-not $connected -and $ProfileName.Trim() -ne $ProfileName) {
-        & netsh wlan connect name="$($ProfileName.Trim())" interface="$InterfaceName" 2>$null | Out-Null
-        for ($i = 0; $i -lt 24; $i++) {
-            Start-Sleep -Milliseconds 150
-            $ifStatus = & netsh wlan show interfaces
-            if ($ifStatus -match "State\s*:\s*connected") {
+    # If still actively completing association/authentication at 4.0s, allow grace period
+    if (-not $connected) {
+        for ($i = 0; $i -lt 40; $i++) {
+            $state = [NativeWlan]::GetInterfaceState()
+            if ($state -eq "connected") {
                 $connected = $true
                 break
             }
+            if ($state -ne "associating" -and $state -ne "authenticating") {
+                break
+            }
+            Start-Sleep -Milliseconds 50
         }
     }
 } else {
     # No profile saved; wait for Windows AutoConfig association
-    for ($i = 0; $i -lt 25; $i++) {
-        Start-Sleep -Milliseconds 200
-        $ifStatus = & netsh wlan show interfaces
-        if ($ifStatus -match "State\s*:\s*connected") {
+    for ($i = 0; $i -lt 80; $i++) {
+        $state = [NativeWlan]::GetInterfaceState()
+        if ($state -eq "connected") {
             $connected = $true
             break
         }
+        Start-Sleep -Milliseconds 50
     }
 }
 
@@ -229,9 +419,11 @@ $elapsedMs = $sw.ElapsedMilliseconds
 $elapsedSec = [math]::Round($elapsedMs / 1000.0, 2)
 
 $finalStatus = & netsh wlan show interfaces
-$stateMatch  = ($finalStatus | Select-String -Pattern "State\s*:\s*(\w+)").Matches.Groups[1].Value
-$ssidMatch   = ($finalStatus | Select-String -Pattern "SSID\s*:\s*(.+)").Matches.Groups[1].Value.Trim()
-$signalMatch = ($finalStatus | Select-String -Pattern "Signal\s*:\s*(\d+%)").Matches.Groups[1].Value
+$stateMatch  = [NativeWlan]::GetInterfaceState()
+$ssidLine    = $finalStatus | Select-String -Pattern '^\s*SSID\s*:\s*(.+)$'
+$ssidMatch   = if ($ssidLine) { $ssidLine.Matches.Groups[1].Value.Trim() } else { "Unknown" }
+$signalLine  = $finalStatus | Select-String -Pattern '^\s*Signal\s*:\s*(\d+%)'
+$signalMatch = if ($signalLine) { $signalLine.Matches.Groups[1].Value } else { "Unknown" }
 
 if ($stateMatch -eq "connected") {
     Write-RecoveryLog "SUCCESS" ("Recovery successful in {0}ms ({1}s)! State: {2}, SSID: '{3}', Signal: {4}." -f $elapsedMs, $elapsedSec, $stateMatch, $ssidMatch, $signalMatch)
