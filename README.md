@@ -40,6 +40,8 @@ flowchart TD
    Because Wi-Fi and Bluetooth share the same RF front-end and combo antenna, unbuffered Adaptive Frequency Hopping (AFH) collisions can desync the transceiver LNA (Low-Noise Amplifier).
 5. **Windows Selective Suspend / PnP Sleep:**
    Windows Power Management aggressively puts the network adapter to sleep under battery and modern standby policies, leaving the baseband in an uninitialized state upon resume.
+6. **WPA3-SAE / 802.11w Protected Management Frames (PMF) Firmware Queue Overflow:**
+   On dual-band access points broadcasting in WPA3-Personal Transition Mode (`WPA3-SAE / WPA2-PSK Mixed`), Windows automatically attempts WPA3-SAE or negotiates 802.11w PMF (Management Frame Protection). Because the legacy Qualcomm QCA61x4A Windows driver (`Qcamain10x64.sys`) lacks hardware cryptographic acceleration buffers for PMF frames, frame decryption falls back to driver/firmware software queues. High multicast management bursts or unhandled PMF SA Query procedures overflow the internal MAC packet buffer, triggering an unrecoverable baseband lockup (RSSI 255) and silent disconnect. Hardening the WLAN profile to pure hardware `WPA2-PSK (AES-CCMP)` with PMF disabled bypasses this firmware flaw and ensures 100% link stability.
 
 ---
 
@@ -148,6 +150,11 @@ If you prefer to review or run each component separately:
    .\recover_wifi.ps1 -Force
    ```
 
+4. **Audit Wi-Fi Link Stability & Latency:**
+   ```powershell
+   .\check-wifi-stability.ps1
+   ```
+
 ---
 
 ## 📊 Performance Benchmarks & Recovery Metrics
@@ -174,6 +181,7 @@ If you prefer to review or run each component separately:
 ```text
 qualcomm-qca61x4a-wifi-fix/
 ├── apply_wifi_permanent_fix.ps1    # Dynamic registry & PCIe ASPM hardening script
+├── check-wifi-stability.ps1        # Real-time stability audit, ICMP quality, and drop counter
 ├── recover_wifi.ps1                # Sub-10s fast-healing engine with dynamic profile detection
 ├── register_wifi_watchdog.ps1      # SYSTEM-level Task Scheduler installer for Event 8002/8003
 ├── install.ps1                     # One-click administrator setup wrapper
