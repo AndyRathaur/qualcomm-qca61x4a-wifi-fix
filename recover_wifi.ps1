@@ -336,20 +336,26 @@ Write-RecoveryLog "RECOVERING" "Initiating transceiver hardware reset cycle on '
 # -------------------------------------------------------------------------
 [NativeWlan]::Reset()
 try {
-    # Fast NDIS disable with netsh fallback
-    Disable-NetAdapter -Name "$InterfaceName" -Confirm:$false -ErrorAction Stop
-} catch {
+    # Fast netsh hardware cycle with NetAdapter fallback
     & netsh interface set interface name="$InterfaceName" admin=DISABLED
+    if ($LASTEXITCODE -ne 0) {
+        Disable-NetAdapter -Name "$InterfaceName" -Confirm:$false -ErrorAction Stop
+    }
+} catch {
+    Disable-NetAdapter -Name "$InterfaceName" -Confirm:$false -ErrorAction SilentlyContinue
 }
 
 # 250ms hardware settle time (optimized from 500ms for faster recovery)
 Start-Sleep -Milliseconds 250
 
 try {
-    # Fast NDIS enable with netsh fallback
-    Enable-NetAdapter -Name "$InterfaceName" -Confirm:$false -ErrorAction Stop
-} catch {
+    # Fast netsh hardware cycle with NetAdapter fallback
     & netsh interface set interface name="$InterfaceName" admin=ENABLED
+    if ($LASTEXITCODE -ne 0) {
+        Enable-NetAdapter -Name "$InterfaceName" -Confirm:$false -ErrorAction Stop
+    }
+} catch {
+    Enable-NetAdapter -Name "$InterfaceName" -Confirm:$false -ErrorAction SilentlyContinue
 }
 
 # -------------------------------------------------------------------------
